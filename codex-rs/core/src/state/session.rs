@@ -2,6 +2,8 @@
 
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::plan_tool::StepStatus;
+use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -34,6 +36,8 @@ pub(crate) struct SessionState {
     pub(crate) pending_session_start_source: Option<codex_hooks::SessionStartSource>,
     granted_permissions: Option<PermissionProfile>,
     next_turn_is_first: bool,
+    active_todo_list: Option<UpdatePlanArgs>,
+    todo_reminder_pending: bool,
 }
 
 impl SessionState {
@@ -53,6 +57,8 @@ impl SessionState {
             pending_session_start_source: None,
             granted_permissions: None,
             next_turn_is_first: true,
+            active_todo_list: None,
+            todo_reminder_pending: false,
         }
     }
 
@@ -83,6 +89,39 @@ impl SessionState {
         let is_first_turn = self.next_turn_is_first;
         self.next_turn_is_first = false;
         is_first_turn
+    }
+
+    pub(crate) fn set_active_todo_list(&mut self, update: UpdatePlanArgs) {
+        let has_active_item = update
+            .plan
+            .iter()
+            .any(|item| !matches!(item.status, StepStatus::Completed));
+        if has_active_item {
+            self.active_todo_list = Some(update);
+            self.todo_reminder_pending = true;
+        } else {
+            self.active_todo_list = None;
+            self.todo_reminder_pending = false;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_todo_list(&self) -> Option<UpdatePlanArgs> {
+        self.active_todo_list.clone()
+    }
+
+    pub(crate) fn queue_todo_reminder_for_next_sampling(&mut self) {
+        if self.active_todo_list.is_some() {
+            self.todo_reminder_pending = true;
+        }
+    }
+
+    pub(crate) fn take_todo_reminder_for_next_sampling(&mut self) -> Option<UpdatePlanArgs> {
+        if !self.todo_reminder_pending {
+            return None;
+        }
+        self.todo_reminder_pending = false;
+        self.active_todo_list.clone()
     }
 
     pub(crate) fn clone_history(&self) -> ContextManager {

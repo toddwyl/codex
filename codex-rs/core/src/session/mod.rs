@@ -99,6 +99,7 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::HasLegacyEvent;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -190,6 +191,7 @@ mod review;
 mod rollout_reconstruction;
 #[allow(clippy::module_inception)]
 pub(crate) mod session;
+mod todo_reminder;
 pub(crate) mod turn;
 pub(crate) mod turn_context;
 #[cfg(test)]
@@ -1183,6 +1185,11 @@ impl Session {
                 let previous_turn_settings = self
                     .apply_rollout_reconstruction(&turn_context, &rollout_items)
                     .await;
+                if let Some(todo) =
+                    todo_reminder::active_todo_list_from_rollout_items(&rollout_items)
+                {
+                    self.set_active_todo_list(todo).await;
+                }
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 let curr: &str = turn_context.model_info.slug.as_str();
@@ -2729,6 +2736,27 @@ impl Session {
     pub(crate) async fn clone_history(&self) -> ContextManager {
         let state = self.state.lock().await;
         state.clone_history()
+    }
+
+    pub(crate) async fn set_active_todo_list(&self, update: UpdatePlanArgs) {
+        let mut state = self.state.lock().await;
+        state.set_active_todo_list(update);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn active_todo_list(&self) -> Option<UpdatePlanArgs> {
+        let state = self.state.lock().await;
+        state.active_todo_list()
+    }
+
+    pub(crate) async fn queue_todo_reminder_for_next_sampling(&self) {
+        let mut state = self.state.lock().await;
+        state.queue_todo_reminder_for_next_sampling();
+    }
+
+    pub(crate) async fn take_todo_reminder_for_next_sampling(&self) -> Option<UpdatePlanArgs> {
+        let mut state = self.state.lock().await;
+        state.take_todo_reminder_for_next_sampling()
     }
 
     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {

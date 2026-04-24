@@ -41,6 +41,7 @@ use crate::plugins::build_plugin_injections;
 use crate::resolve_skill_dependencies_for_turn;
 use crate::session::PreviousTurnSettings;
 use crate::session::session::Session;
+use crate::session::todo_reminder::append_todo_reminder;
 use crate::session::turn_context::TurnContext;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::handle_non_tool_response_item;
@@ -375,6 +376,9 @@ pub(crate) async fn run_turn(
     // 1. At the start of a turn, so the fresh user prompt in `input` gets sampled first.
     // 2. After auto-compact, when model/tool continuation needs to resume before any steer.
     let mut can_drain_pending_input = input.is_empty();
+    if !input.is_empty() {
+        sess.queue_todo_reminder_for_next_sampling().await;
+    }
 
     loop {
         if run_pending_session_start_hooks(&sess, &turn_context).await {
@@ -1061,6 +1065,10 @@ async fn run_sampling_request(
                 .await
                 .for_prompt(&turn_context.model_info.input_modalities)
         };
+        let prompt_input = append_todo_reminder(
+            prompt_input,
+            sess.take_todo_reminder_for_next_sampling().await,
+        );
         let prompt = build_prompt(
             prompt_input,
             router.as_ref(),
