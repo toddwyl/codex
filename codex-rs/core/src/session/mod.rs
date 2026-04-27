@@ -66,10 +66,8 @@ use codex_mcp::McpConnectionManager;
 use codex_mcp::McpRuntimeEnvironment;
 use codex_mcp::ToolInfo;
 use codex_mcp::codex_apps_tools_cache_key;
-#[cfg(test)]
-use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
-use codex_models_manager::manager::ModelsManager;
 use codex_models_manager::manager::RefreshStrategy;
+use codex_models_manager::manager::SharedModelsManager;
 use codex_network_proxy::NetworkProxy;
 use codex_network_proxy::NetworkProxyAuditMetadata;
 use codex_network_proxy::normalize_host;
@@ -92,11 +90,12 @@ use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::mcp::CallToolResult;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::models::format_allow_prefixes;
 use codex_protocol::openai_models::ModelInfo;
-use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::plan_tool::UpdatePlanArgs;
@@ -178,8 +177,8 @@ use crate::context_manager::TotalTokenUsageBreakdown;
 use crate::thread_rollout_truncation::initial_history_has_prior_user_turns;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::types::McpServerConfig;
-use codex_config::types::ShellEnvironmentPolicy;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 #[cfg(test)]
@@ -296,8 +295,6 @@ use crate::tasks::GhostSnapshotTask;
 use crate::tasks::ReviewTask;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
-use crate::tools::js_repl::JsReplHandle;
-use crate::tools::js_repl::resolve_compatible_node;
 use crate::tools::network_approval::NetworkApprovalService;
 use crate::tools::network_approval::build_blocked_request_observer;
 use crate::tools::network_approval::build_network_policy_decider;
@@ -393,7 +390,7 @@ pub struct CodexSpawnOk {
 pub(crate) struct CodexSpawnArgs {
     pub(crate) config: Config,
     pub(crate) auth_manager: Arc<AuthManager>,
-    pub(crate) models_manager: Arc<ModelsManager>,
+    pub(crate) models_manager: SharedModelsManager,
     pub(crate) environment_manager: Arc<EnvironmentManager>,
     pub(crate) skills_manager: Arc<SkillsManager>,
     pub(crate) plugins_manager: Arc<PluginsManager>,
@@ -503,34 +500,6 @@ impl Codex {
             let _ = config.features.disable(Feature::Collab);
         }
 
-        if config.features.enabled(Feature::JsRepl)
-            && let Err(err) = resolve_compatible_node(config.js_repl_node_path.as_deref()).await
-        {
-            let _ = config.features.disable(Feature::JsRepl);
-            let _ = config.features.disable(Feature::JsReplToolsOnly);
-            let message = if config.features.enabled(Feature::JsRepl) {
-                format!(
-                    "`js_repl` remains enabled because enterprise requirements pin it on, but the configured Node runtime is unavailable or incompatible. {err}"
-                )
-            } else {
-                format!(
-                    "Disabled `js_repl` for this session because the configured Node runtime is unavailable or incompatible. {err}"
-                )
-            };
-            warn!("{message}");
-            config.startup_warnings.push(message);
-        }
-        if config.features.enabled(Feature::CodeMode)
-            && let Err(err) = resolve_compatible_node(config.js_repl_node_path.as_deref()).await
-        {
-            let message = format!(
-                "Disabled `exec` for this session because the configured Node runtime is unavailable or incompatible. {err}"
-            );
-            warn!("{message}");
-            let _ = config.features.disable(Feature::CodeMode);
-            config.startup_warnings.push(message);
-        }
-
         let user_instructions = AgentsMdManager::new(&config)
             .user_instructions(environment.as_deref())
             .await;
@@ -637,9 +606,7 @@ impl Codex {
             compact_prompt: config.compact_prompt.clone(),
             approval_policy: config.permissions.approval_policy.clone(),
             approvals_reviewer: config.approvals_reviewer,
-            sandbox_policy: config.permissions.sandbox_policy.clone(),
-            file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
-            network_sandbox_policy: config.permissions.network_sandbox_policy,
+            permission_profile: config.permissions.permission_profile.clone(),
             windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
             cwd: config.cwd.clone(),
             codex_home: config.codex_home.clone(),
@@ -880,8 +847,10 @@ impl Session {
         }
     }
 
-    fn managed_network_proxy_active_for_sandbox_policy(sandbox_policy: &SandboxPolicy) -> bool {
-        !matches!(sandbox_policy, SandboxPolicy::DangerFullAccess)
+    fn managed_network_proxy_active_for_permission_profile(
+        permission_profile: &PermissionProfile,
+    ) -> bool {
+        !matches!(permission_profile, PermissionProfile::Disabled)
     }
 
     /// Builds the `x-codex-beta-features` header value for this session.
@@ -914,7 +883,7 @@ impl Session {
     async fn start_managed_network_proxy(
         spec: &crate::config::NetworkProxySpec,
         exec_policy: &codex_execpolicy::Policy,
-        sandbox_policy: &SandboxPolicy,
+        permission_profile: &PermissionProfile,
         network_policy_decider: Option<Arc<dyn codex_network_proxy::NetworkPolicyDecider>>,
         blocked_request_observer: Option<Arc<dyn codex_network_proxy::BlockedRequestObserver>>,
         managed_network_requirements_enabled: bool,
@@ -931,7 +900,7 @@ impl Session {
             .unwrap_or_else(|_| spec.clone());
         let network_proxy = spec
             .start_proxy(
-                sandbox_policy,
+                permission_profile,
                 network_policy_decider,
                 blocked_request_observer,
                 managed_network_requirements_enabled,
@@ -949,7 +918,7 @@ impl Session {
         Ok((network_proxy, session_network_proxy))
     }
 
-    async fn refresh_managed_network_proxy_for_current_sandbox_policy(&self) {
+    async fn refresh_managed_network_proxy_for_current_permission_profile(&self) {
         let Some(started_proxy) = self.services.network_proxy.as_ref() else {
             return;
         };
@@ -971,7 +940,7 @@ impl Session {
         };
 
         let spec = match spec
-            .recompute_for_sandbox_policy(session_configuration.sandbox_policy.get())
+            .recompute_for_permission_profile(&session_configuration.permission_profile())
         {
             Ok(spec) => spec,
             Err(err) => {
@@ -1326,7 +1295,7 @@ impl Session {
         &self,
         updates: SessionSettingsUpdate,
     ) -> ConstraintResult<()> {
-        let (previous_cwd, sandbox_policy_changed, next_cwd, codex_home, session_source) = {
+        let (previous_cwd, permission_profile_changed, next_cwd, codex_home, session_source) = {
             let mut state = self.state.lock().await;
             let updated = match state.session_configuration.apply(&updates) {
                 Ok(updated) => updated,
@@ -1337,15 +1306,17 @@ impl Session {
             };
 
             let previous_cwd = state.session_configuration.cwd.clone();
-            let sandbox_policy_changed =
-                state.session_configuration.sandbox_policy != updated.sandbox_policy;
+            let previous_permission_profile = state.session_configuration.permission_profile();
+            let updated_permission_profile = updated.permission_profile();
+            let permission_profile_changed =
+                previous_permission_profile != updated_permission_profile;
             let next_cwd = updated.cwd.clone();
             let codex_home = updated.codex_home.clone();
             let session_source = updated.session_source.clone();
             state.session_configuration = updated;
             (
                 previous_cwd,
-                sandbox_policy_changed,
+                permission_profile_changed,
                 next_cwd,
                 codex_home,
                 session_source,
@@ -1358,8 +1329,8 @@ impl Session {
             &codex_home,
             &session_source,
         );
-        if sandbox_policy_changed {
-            self.refresh_managed_network_proxy_for_current_sandbox_policy()
+        if permission_profile_changed {
+            self.refresh_managed_network_proxy_for_current_permission_profile()
                 .await;
         }
 
@@ -1852,7 +1823,7 @@ impl Session {
         reason: Option<String>,
         network_approval_context: Option<NetworkApprovalContext>,
         proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
-        additional_permissions: Option<PermissionProfile>,
+        additional_permissions: Option<AdditionalPermissionProfile>,
         available_decisions: Option<Vec<ReviewDecision>>,
     ) -> ReviewDecision {
         //  command-level approvals use `call_id`.
@@ -2274,7 +2245,8 @@ impl Session {
             PermissionGrantScope::Turn => {
                 if let Some(turn_state) = originating_turn_state {
                     let mut ts = turn_state.lock().await;
-                    let permissions: PermissionProfile = response.permissions.clone().into();
+                    let permissions: AdditionalPermissionProfile =
+                        response.permissions.clone().into();
                     ts.record_granted_permissions(permissions);
                     if response.strict_auto_review {
                         ts.enable_strict_auto_review();
@@ -2292,7 +2264,7 @@ impl Session {
         clippy::await_holding_invalid_type,
         reason = "active turn reads must stay consistent with the matching turn state"
     )]
-    pub(crate) async fn granted_turn_permissions(&self) -> Option<PermissionProfile> {
+    pub(crate) async fn granted_turn_permissions(&self) -> Option<AdditionalPermissionProfile> {
         let active = self.active_turn.lock().await;
         let active = active.as_ref()?;
         let ts = active.turn_state.lock().await;
@@ -2312,7 +2284,7 @@ impl Session {
         ts.strict_auto_review_enabled()
     }
 
-    pub(crate) async fn granted_session_permissions(&self) -> Option<PermissionProfile> {
+    pub(crate) async fn granted_session_permissions(&self) -> Option<AdditionalPermissionProfile> {
         let state = self.state.lock().await;
         state.granted_permissions()
     }
@@ -2399,7 +2371,6 @@ impl Session {
             content: vec![ContentItem::InputText {
                 text: format!("Warning: {}", message.into()),
             }],
-            end_turn: None,
             phase: None,
         };
 
@@ -2555,8 +2526,8 @@ impl Session {
         }
         if turn_context.config.include_permissions_instructions {
             developer_sections.push(
-                PermissionsInstructions::from_policy(
-                    turn_context.sandbox_policy.get(),
+                PermissionsInstructions::from_permission_profile(
+                    &turn_context.permission_profile,
                     turn_context.approval_policy.value(),
                     turn_context.config.approvals_reviewer,
                     self.services.exec_policy.current().as_ref(),
@@ -2634,12 +2605,8 @@ impl Session {
             }
         }
         if turn_context.config.include_skill_instructions {
-            let implicit_skills = turn_context
-                .turn_skills
-                .outcome
-                .allowed_skills_for_implicit_invocation();
             let available_skills = build_available_skills(
-                &implicit_skills,
+                &turn_context.turn_skills.outcome,
                 default_skill_metadata_budget(turn_context.model_info.context_window),
                 SkillRenderSideEffects::ThreadStart {
                     session_telemetry: &self.services.session_telemetry,
@@ -3251,10 +3218,10 @@ impl Session {
 
     pub async fn interrupt_task(self: &Arc<Self>) {
         info!("interrupt received: abort current task, if any");
-        let has_active_turn = { self.active_turn.lock().await.is_some() };
-        if has_active_turn {
-            self.abort_all_tasks(TurnAbortReason::Interrupted).await;
-        } else {
+        let had_active_turn = self.active_turn.lock().await.is_some();
+        // Even without an active task, interrupt handling pauses any active goal.
+        self.abort_all_tasks(TurnAbortReason::Interrupted).await;
+        if !had_active_turn {
             self.cancel_mcp_startup().await;
         }
     }

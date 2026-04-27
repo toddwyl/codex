@@ -14,10 +14,12 @@ use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::sandboxing::SandboxPermissions;
 use codex_features::Feature;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::TurnEnvironmentSelection;
@@ -96,10 +98,6 @@ async fn empty_turn_environments_omits_environment_backed_tools() -> Result<()> 
             .features
             .enable(Feature::UnifiedExec)
             .expect("unified exec should enable for test");
-        config
-            .features
-            .enable(Feature::JsRepl)
-            .expect("js repl should enable for test");
         config.include_apply_patch_tool = true;
     });
     let test = builder.build(&server).await?;
@@ -112,14 +110,7 @@ async fn empty_turn_environments_omits_environment_backed_tools() -> Result<()> 
         tools.contains(&"update_plan".to_string()),
         "non-environment tool should remain available; got {tools:?}"
     );
-    for environment_tool in [
-        "exec_command",
-        "write_stdin",
-        "js_repl",
-        "js_repl_reset",
-        "apply_patch",
-        "view_image",
-    ] {
+    for environment_tool in ["exec_command", "write_stdin", "apply_patch", "view_image"] {
         assert!(
             !tools.contains(&environment_tool.to_string()),
             "{environment_tool} should be omitted for explicit empty turn environments; got {tools:?}"
@@ -571,7 +562,11 @@ async fn shell_enforces_glob_deny_read_policy() -> Result<()> {
                     },
                     access: FileSystemAccessMode::None,
                 });
-            config.permissions.file_system_sandbox_policy = file_system_sandbox_policy;
+            config.permissions.permission_profile =
+                Constrained::allow_any(PermissionProfile::from_runtime_permissions(
+                    &file_system_sandbox_policy,
+                    NetworkSandboxPolicy::Restricted,
+                ));
         });
     let fixture = builder.build(&server).await?;
 
