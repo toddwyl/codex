@@ -89,6 +89,7 @@ pub(crate) async fn handle_update_plan(
         ));
     }
     let args = parse_update_plan_arguments(&arguments)?;
+    session.set_active_todo_list(args.clone()).await;
     session
         .send_event(turn_context, EventMsg::PlanUpdate(args))
         .await;
@@ -99,4 +100,67 @@ fn parse_update_plan_arguments(arguments: &str) -> Result<UpdatePlanArgs, Functi
     serde_json::from_str::<UpdatePlanArgs>(arguments).map_err(|e| {
         FunctionCallError::RespondToModel(format!("failed to parse function arguments: {e}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use codex_protocol::plan_tool::StepStatus;
+    use pretty_assertions::assert_eq;
+
+    use super::handle_update_plan;
+    use crate::session::tests::make_session_and_context;
+
+    #[tokio::test]
+    async fn update_plan_records_active_todo_list_in_session_state() {
+        let (session, turn_context) = make_session_and_context().await;
+        let arguments = serde_json::json!({
+            "explanation": "Keep work ordered",
+            "plan": [
+                {"step": "Record todo state", "status": "in_progress"},
+                {"step": "Inject reminder", "status": "pending"}
+            ]
+        })
+        .to_string();
+
+        handle_update_plan(&session, &turn_context, arguments, "call-1".to_string())
+            .await
+            .expect("update_plan should succeed");
+
+        let active = session
+            .active_todo_list()
+            .await
+            .expect("active todo list should be recorded");
+        assert_eq!(active.explanation.as_deref(), Some("Keep work ordered"));
+        assert_eq!(active.plan.len(), 2);
+        assert_eq!(active.plan[0].step, "Record todo state");
+        assert!(matches!(active.plan[0].status, StepStatus::InProgress));
+        assert_eq!(active.plan[1].step, "Inject reminder");
+        assert!(matches!(active.plan[1].status, StepStatus::Pending));
+    }
+
+    #[tokio::test]
+    async fn update_plan_clears_session_todo_list_when_all_steps_are_completed() {
+        let (session, turn_context) = make_session_and_context().await;
+        let active = serde_json::json!({
+            "plan": [
+                {"step": "Record todo state", "status": "in_progress"}
+            ]
+        })
+        .to_string();
+        handle_update_plan(&session, &turn_context, active, "call-1".to_string())
+            .await
+            .expect("active update_plan should succeed");
+
+        let completed = serde_json::json!({
+            "plan": [
+                {"step": "Record todo state", "status": "completed"}
+            ]
+        })
+        .to_string();
+        handle_update_plan(&session, &turn_context, completed, "call-2".to_string())
+            .await
+            .expect("completed update_plan should succeed");
+
+        assert!(session.active_todo_list().await.is_none());
+    }
 }

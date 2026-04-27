@@ -141,11 +141,22 @@ async fn update_plan_tool_emits_plan_update_event() -> anyhow::Result<()> {
     ]);
     responses::mount_sse_once(&server, first_response).await;
 
+    let shell_call_id = "shell-after-plan";
+    let shell_args = json!({
+        "command": ["/bin/echo", "after plan"],
+        "timeout_ms": 2_000,
+    });
     let second_response = sse(vec![
-        ev_assistant_message("msg-1", "plan acknowledged"),
+        ev_response_created("resp-2"),
+        ev_function_call(shell_call_id, "shell", &serde_json::to_string(&shell_args)?),
         ev_completed("resp-2"),
     ]);
     let second_mock = responses::mount_sse_once(&server, second_response).await;
+    let third_response = sse(vec![
+        ev_assistant_message("msg-1", "plan acknowledged"),
+        ev_completed("resp-3"),
+    ]);
+    let third_mock = responses::mount_sse_once(&server, third_response).await;
 
     let session_model = session_configured.model.clone();
 
@@ -191,8 +202,53 @@ async fn update_plan_tool_emits_plan_update_event() -> anyhow::Result<()> {
     assert!(saw_plan_update, "expected PlanUpdate event");
 
     let req = second_mock.single_request();
+    let second_request_body = req.body_json().to_string();
+    assert!(second_request_body.contains("Current todo list reminder"));
+    assert!(second_request_body.contains("[in_progress] Inspect workspace"));
+    assert!(second_request_body.contains("[pending] Report results"));
     let (output_text, _success_flag) = call_output(&req, call_id);
     assert_eq!(output_text, "Plan updated");
+
+    let third_request_body = third_mock.single_request().body_json().to_string();
+    assert!(
+        !third_request_body.contains("Current todo list reminder"),
+        "todo reminder should be consumed after the first post-update_plan sampling request"
+    );
+
+    let fourth_response = sse(vec![
+        ev_assistant_message("msg-2", "continuing with existing plan"),
+        ev_completed("resp-4"),
+    ]);
+    let fourth_mock = responses::mount_sse_once(&server, fourth_response).await;
+
+    codex
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: "continue the plan".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
+            model: session_configured.model.clone(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let fourth_request_body = fourth_mock.single_request().body_json().to_string();
+    assert!(fourth_request_body.contains("Current todo list reminder"));
+    assert!(fourth_request_body.contains("[in_progress] Inspect workspace"));
+    assert!(fourth_request_body.contains("[pending] Report results"));
 
     Ok(())
 }

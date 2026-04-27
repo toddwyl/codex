@@ -81,6 +81,7 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ConversationAudioParams;
@@ -1271,6 +1272,45 @@ async fn record_initial_history_reconstructs_resumed_transcript() {
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(expected, history.raw_items());
+}
+
+#[tokio::test]
+async fn record_initial_history_resumed_restores_active_update_plan_todo_list() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let arguments = serde_json::json!({
+        "explanation": "Resume active work",
+        "plan": [
+            {"step": "Restore todo state", "status": "in_progress"},
+            {"step": "Remind on resumed turn", "status": "pending"}
+        ]
+    })
+    .to_string();
+    let rollout_items = vec![RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+        id: None,
+        name: "update_plan".to_string(),
+        namespace: None,
+        arguments,
+        call_id: "call-1".to_string(),
+    })];
+
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: ThreadId::default(),
+            history: rollout_items,
+            rollout_path: PathBuf::from("/tmp/resume.jsonl"),
+        }))
+        .await;
+
+    let active = session
+        .active_todo_list()
+        .await
+        .expect("resumed update_plan todo list should be restored");
+    assert_eq!(active.explanation.as_deref(), Some("Resume active work"));
+    assert_eq!(active.plan.len(), 2);
+    assert_eq!(active.plan[0].step, "Restore todo state");
+    assert!(matches!(active.plan[0].status, StepStatus::InProgress));
+    assert_eq!(active.plan[1].step, "Remind on resumed turn");
+    assert!(matches!(active.plan[1].status, StepStatus::Pending));
 }
 
 #[tokio::test]
